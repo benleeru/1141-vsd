@@ -191,10 +191,9 @@ module top (
         .imm(imm)          // 剛剛宣告 imm; <--- 這裡為什麼接 "imm_out"？
     );
     HazardDetectionUnit HazardDetectionUnit_inst(
-        .if_id_inst(if_id_inst),
         .id_ex_mem_read(id_ex_mem_read),
+        .if_id_inst(if_id_inst),
         .id_ex_rd_addr(id_ex_rd_addr),
-        .branch_taken(branch_taken),
         .ex_mem_mem_read(ex_mem_mem_read),
         .ex_mem_rd_addr(ex_mem_rd_addr),
         .ex_mem_reg_write(ex_mem_reg_write),
@@ -642,7 +641,7 @@ module HazardDetectionUnit(
         pc_write    = 1'b1;
         if_id_write = 1'b1;
         ctrl_flush  = 1'b0;
-        
+
         // ==========================================================
         // 條件 A: 標準 Load-Use Hazard (Distance 1)
         // ==========================================================
@@ -677,7 +676,7 @@ module BranchResolutionUnit (
     input [31:0]  pc,               // 來自 IF/ID PC (為了算 JAL/Branch target)
     input [31:0]  rs1_data,         // 來自 forwarding MUX 選擇過 ???
     input [31:0]  rs2_data,
-    output        branch_taken,     // 告訴 Top Level 要不要 Flush
+    output reg    branch_taken,     // 告訴 Top Level 要不要 Flush
     output [31:0] branch_target     // 告訴 PC Mux 下一跳去哪
 );
     // 優化：branch_target共用同一個加法器
