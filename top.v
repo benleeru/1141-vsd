@@ -194,10 +194,56 @@ module top (
         .if_id_inst(if_id_inst),
         .id_ex_mem_read(id_ex_mem_read),
         .id_ex_rd_addr(id_ex_rd_addr),
+        .branch_taken(branch_taken),
+        .ex_mem_mem_read(ex_mem_mem_read),
+        .ex_mem_rd_addr(ex_mem_rd_addr),
+        .ex_mem_reg_write(ex_mem_reg_write),
+        .mem_wb_reg_write(mem_wb_reg_write),
         .pc_write(pc_write),
         .if_id_write(if_id_write),
         .ctrl_flush(ctrl_flush)
     );
+    // ID Forwarding MUX rs1_data_resolved & rs2_data_resolved
+    wire [4:0] id_rs1_addr = if_id_inst[19:15];
+    wire [4:0] id_rs2_addr = if_id_inst[24:20];
+    reg [31:0] id_rs1_data_resolved;
+    reg [31:0] id_rs2_data_resolved;
+    always @(*) begin
+        // 優先權 1: Forward from EX stage (ALU to Branch - Aggressive Forwarding)
+        // 這是 critical path & stall 的 trade-off：如果上一條是 ALU 運算，直接 forward，不用 Stall！因為for loop 一直 stall 反而不划算 
+        if (id_ex_reg_write && (id_ex_rd_addr != 0) && (id_ex_rd_addr == id_rs1_addr)) begin
+            id_rs1_data_resolved = alu_result; 
+        end
+        // 優先權 2: Forward from MEM stage (Load Stall 後的資料，或是 ALU 運算)
+        else if (ex_mem_reg_write && (ex_mem_rd_addr != 0) && (ex_mem_rd_addr == id_rs1_addr)) begin
+            if (ex_mem_mem_read) id_rs1_data_resolved = RDATA_DM[31:0]; // 假設 Load Stall 結束，資料從 DM 回來了
+            else                 id_rs1_data_resolved = ex_mem_alu_out;
+        end
+        // 優先權 3: Forward from WB stage
+        else if (mem_wb_reg_write && (mem_wb_rd_addr != 0) && (mem_wb_rd_addr == id_rs1_addr)) begin
+            id_rs1_data_resolved = wb_write_data;
+        end
+        // 預設: 讀 RegFile
+        else begin
+            id_rs1_data_resolved = rs1_data_out;
+        end
+    end
+    always @(*) begin
+        if (id_ex_reg_write && (id_ex_rd_addr != 0) && (id_ex_rd_addr == id_rs2_addr)) begin
+            id_rs2_data_resolved = alu_result;
+        end
+        else if (ex_mem_reg_write && (ex_mem_rd_addr != 0) && (ex_mem_rd_addr == id_rs2_addr)) begin
+            if (ex_mem_mem_read) id_rs2_data_resolved = RDATA_DM[31:0];
+            else                 id_rs2_data_resolved = ex_mem_alu_out;
+        end
+        else if (mem_wb_reg_write && (mem_wb_rd_addr != 0) && (mem_wb_rd_addr == id_rs2_addr)) begin
+            id_rs2_data_resolved = wb_write_data;
+        end
+        else begin
+            id_rs2_data_resolved = rs2_data_out;
+        end
+    end
+
     BranchResolutionUnit BranchResolutionUnit_inst(
         .funct3(id_funct3),
         .opcode(id_opcode),
@@ -543,8 +589,8 @@ module ForwardingUnit(
     input       ex_mem_reg_write,
     input [4:0] mem_wb_rd_addr,     // 上上個指令
     input       mem_wb_reg_write,
-    output reg [1:0] forward_a, // 控制 rs1
-    output reg [1:0] forward_b  // 控制 rs2
+    output reg [1:0] forward_a,     // 控制 rs1
+    output reg [1:0] forward_b      // 控制 rs2
 );
     localparam no_hazard  = 2'b00; 
     localparam mem_hazard = 2'b01;  // MEM Forward (最優先) data_hazard_occur_at_mem_stage
@@ -569,10 +615,10 @@ module HazardDetectionUnit(
     input        id_ex_mem_read,
     input [31:0] if_id_inst,
     input [4:0]  id_ex_rd_addr,
-    // branch_taken 發生時
-    input        branch_taken,
+
     // 檢查前面指令有沒有 LW data hazard
     input        ex_mem_mem_read,
+    input        ex_mem_rd_addr,
     // 檢查前面指令有沒有 單純拿 ALU 算出來的東西的 data hazard
     input        ex_mem_reg_write,
     input        mem_wb_reg_write,
@@ -581,36 +627,58 @@ module HazardDetectionUnit(
     output reg if_id_write,
     output reg ctrl_flush
 ); 
+    wire [6:0] opcode   = if_id_inst[6:0];
     wire [4:0] rs1_addr = if_id_inst[19:15];
     wire [4:0] rs2_addr = if_id_inst[24:20];
-    wire [:] ;
-    wire [:] ;
+    // [修正] 判斷這是不是一條 Branch 指令 (B-Type)
+    // 只要是 Branch，我們就要特別小心處理資料相依
+    wire is_branch = (opcode == 7'b1100011); 
+    // 補充：其實 JALR (1100111) 也需要讀 rs1 來算跳轉目標
+    // 如果你要更嚴謹，可以把 JALR 也加進去：
+    wire is_jump_reg = (opcode == 7'b1100111);
+
     always @(*) begin
+        // 預設值：不 Stall
         pc_write    = 1'b1;
         if_id_write = 1'b1;
         ctrl_flush  = 1'b0;
-        // 偵測 Load-Use Hazard 需要 stall
-        if(id_ex_mem_read==1 && (id_ex_rd_addr==rs1_addr || id_ex_rd_addr==rs2_addr)) begin
+        
+        // ==========================================================
+        // 條件 A: 標準 Load-Use Hazard (Distance 1)
+        // ==========================================================
+        // 上一條指令 (EX) 是 Load，且寫入目標等於目前的 rs1 或 rs2。
+        // 這會擋住所有需要用 rs1/rs2 的指令 (包含 ADD, SUB, 以及 Branch)
+        if (id_ex_mem_read && (id_ex_rd_addr == rs1_addr || id_ex_rd_addr == rs2_addr)) begin
             pc_write    = 1'b0;
             if_id_write = 1'b0;
             ctrl_flush  = 1'b1;
         end
-        // 針對 branch prediction 的 LW use hazard
-        else if() begin
-            
+        
+        // ==========================================================
+        // 條件 B: Branch Specific Load-Use Hazard (Distance 2)
+        // ==========================================================
+        // 上上條指令 (MEM) 是 Load，且目前的 ID 是 Branch。
+        // 因為我們為了 Ranking 1 決定不從 MEM 拉線回 ID (怕太慢)，
+        // 所以必須在這裡多 Stall 一個 Cycle，等 Load 走到 WB 階段。
+        else if (ex_mem_mem_read && (ex_mem_rd_addr == rs1_addr || ex_mem_rd_addr == rs2_addr) && is_branch) begin
+            // [關鍵] 這裡用 is_branch，而不是 branch_taken！
+            pc_write    = 1'b0;
+            if_id_write = 1'b0;
+            ctrl_flush  = 1'b1;
         end
+
     end
 endmodule
 
 module BranchResolutionUnit ( 
     input [2:0]   funct3,   
     input [6:0]   opcode,        
-    input [31:0]  imm,           // 來自 ImmGen
-    input [31:0]  pc,            // 來自 IF/ID PC (為了算 JAL/Branch target)
-    input [31:0]  rs1_data,      // 來自 forwarding MUX 選擇過 ???
+    input [31:0]  imm,              // 來自 ImmGen
+    input [31:0]  pc,               // 來自 IF/ID PC (為了算 JAL/Branch target)
+    input [31:0]  rs1_data,         // 來自 forwarding MUX 選擇過 ???
     input [31:0]  rs2_data,
-    output        branch_taken,        // 告訴 Top Level 要不要 Flush
-    output [31:0] branch_target // 告訴 PC Mux 下一跳去哪
+    output        branch_taken,     // 告訴 Top Level 要不要 Flush
+    output [31:0] branch_target     // 告訴 PC Mux 下一跳去哪
 );
     // 優化：branch_target共用同一個加法器
     wire [31:0] base_addr;
