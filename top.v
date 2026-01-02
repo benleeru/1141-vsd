@@ -64,6 +64,7 @@ module top (
     reg        id_ex_mem_to_reg;
     reg        id_ex_alu_src;
     reg [3:0]  id_ex_alu_op;
+    reg        id_ex_is_jal;
 
     // ---EX/MEM Stage Registers ---
     reg [31:0] ex_mem_alu_out;
@@ -106,6 +107,7 @@ module top (
     wire        ctrl_mem_to_reg; 
     wire        ctrl_alu_src;
     wire [3:0]  ctrl_alu_op;
+    wire        ctrl_is_jal;
     // HazardDetectionUnit 
     wire        pc_write;
     wire        if_id_write;
@@ -172,8 +174,8 @@ module top (
         .mem_read   (ctrl_mem_read),
         .mem_write  (ctrl_mem_write),
         .mem_to_reg (ctrl_mem_to_reg),
-        .imm_type   (ctrl_imm_type),
-        .alu_op     (ctrl_alu_op)
+        .alu_op     (ctrl_alu_op),
+        .is_jal     (ctrl_is_jal)
     );
     RegFile regfile_inst(
         .clk        (clk),
@@ -196,52 +198,62 @@ module top (
         .id_ex_rd_addr(id_ex_rd_addr),
         .ex_mem_mem_read(ex_mem_mem_read),
         .ex_mem_rd_addr(ex_mem_rd_addr),
-        .ex_mem_reg_write(ex_mem_reg_write),
-        .mem_wb_reg_write(mem_wb_reg_write),
+        //.ex_mem_reg_write(ex_mem_reg_write),
+        //.mem_wb_reg_write(mem_wb_reg_write),
         .pc_write(pc_write),
         .if_id_write(if_id_write),
         .ctrl_flush(ctrl_flush)
     );
+    
     // ID Forwarding MUX rs1_data_resolved & rs2_data_resolved
+    // 解析目前 ID 階段指令的 rs1, rs2 地址
     wire [4:0] id_rs1_addr = if_id_inst[19:15];
     wire [4:0] id_rs2_addr = if_id_inst[24:20];
-    reg [31:0] id_rs1_data_resolved;
-    reg [31:0] id_rs2_data_resolved;
-    always @(*) begin
-        // 優先權 1: Forward from EX stage (ALU to Branch - Aggressive Forwarding)
-        // 這是 critical path & stall 的 trade-off：如果上一條是 ALU 運算，直接 forward，不用 Stall！因為for loop 一直 stall 反而不划算 
-        if (id_ex_reg_write && (id_ex_rd_addr != 0) && (id_ex_rd_addr == id_rs1_addr)) begin
-            id_rs1_data_resolved = alu_result; 
-        end
-        // 優先權 2: Forward from MEM stage (Load Stall 後的資料，或是 ALU 運算)
-        else if (ex_mem_reg_write && (ex_mem_rd_addr != 0) && (ex_mem_rd_addr == id_rs1_addr)) begin
-            if (ex_mem_mem_read) id_rs1_data_resolved = RDATA_DM[31:0]; // 假設 Load Stall 結束，資料從 DM 回來了
-            else                 id_rs1_data_resolved = ex_mem_alu_out;
-        end
-        // 優先權 3: Forward from WB stage
-        else if (mem_wb_reg_write && (mem_wb_rd_addr != 0) && (mem_wb_rd_addr == id_rs1_addr)) begin
-            id_rs1_data_resolved = wb_write_data;
-        end
-        // 預設: 讀 RegFile
-        else begin
-            id_rs1_data_resolved = rs1_data_out;
-        end
-    end
-    always @(*) begin
-        if (id_ex_reg_write && (id_ex_rd_addr != 0) && (id_ex_rd_addr == id_rs2_addr)) begin
-            id_rs2_data_resolved = alu_result;
-        end
-        else if (ex_mem_reg_write && (ex_mem_rd_addr != 0) && (ex_mem_rd_addr == id_rs2_addr)) begin
-            if (ex_mem_mem_read) id_rs2_data_resolved = RDATA_DM[31:0];
-            else                 id_rs2_data_resolved = ex_mem_alu_out;
-        end
-        else if (mem_wb_reg_write && (mem_wb_rd_addr != 0) && (mem_wb_rd_addr == id_rs2_addr)) begin
-            id_rs2_data_resolved = wb_write_data;
-        end
-        else begin
-            id_rs2_data_resolved = rs2_data_out;
-        end
-    end
+    // 進入 BranchResolutionUnit 的資料線
+    wire [31:0] id_rs1_data_resolved; 
+    wire [31:0] id_rs2_data_resolved; 
+    // 1. RS1 的 Forwarding MUX
+    ID_Forwarding_Mux u_id_fwd_rs1 (
+        .rs_addr          (id_rs1_addr),
+        .reg_rdata        (rs1_data_out),     // 來自 RegFile                
+        // EX Stage info
+        .id_ex_rd_addr    (id_ex_rd_addr),
+        .id_ex_reg_write  (id_ex_reg_write),
+        .alu_result       (alu_result),       // EX 階段剛算出來的        
+        // MEM Stage info
+        .ex_mem_rd_addr   (ex_mem_rd_addr),
+        .ex_mem_reg_write (ex_mem_reg_write),
+        .ex_mem_mem_read  (ex_mem_mem_read),
+        .ex_mem_alu_out   (ex_mem_alu_out),
+        .mem_rdata        (RDATA_DM[31:0]),   // 注意：假設 Data Cache 回傳低 32 bits        
+        // WB Stage info
+        .mem_wb_rd_addr   (mem_wb_rd_addr),
+        .mem_wb_reg_write (mem_wb_reg_write),
+        .wb_write_data    (wb_write_data),        
+        // Output
+        .resolved_data    (id_rs1_data_resolved)
+    );
+    // 2. RS2 的 Forwarding MUX
+    ID_Forwarding_Mux u_id_fwd_rs2 (
+        .rs_addr          (id_rs2_addr),
+        .reg_rdata        (rs2_data_out),     // 來自 RegFile       
+        // EX Stage info
+        .id_ex_rd_addr    (id_ex_rd_addr),
+        .id_ex_reg_write  (id_ex_reg_write),
+        .alu_result       (alu_result),       
+        // MEM Stage info
+        .ex_mem_rd_addr   (ex_mem_rd_addr),
+        .ex_mem_reg_write (ex_mem_reg_write),
+        .ex_mem_mem_read  (ex_mem_mem_read),
+        .ex_mem_alu_out   (ex_mem_alu_out),
+        .mem_rdata        (RDATA_DM[31:0]),       
+        // WB Stage info
+        .mem_wb_rd_addr   (mem_wb_rd_addr),
+        .mem_wb_reg_write (mem_wb_reg_write),
+        .wb_write_data    (wb_write_data),       
+        // Output
+        .resolved_data    (id_rs2_data_resolved)
+    );
 
     BranchResolutionUnit BranchResolutionUnit_inst(
         .funct3(id_funct3),
@@ -270,6 +282,7 @@ module top (
             id_ex_mem_to_reg    <=  1'b0; 
             id_ex_alu_src       <=  1'b0; 
             id_ex_alu_op        <=  1'b0;
+            id_ex_is_jal        <=  1'b0;
         end 
         else if (ctrl_flush) begin
             // 把所有控制訊號歸零，模擬一個 NOP
@@ -296,6 +309,7 @@ module top (
             id_ex_alu_src       <= ctrl_alu_src;
             id_ex_reg_write     <= ctrl_reg_write;
             id_ex_alu_op        <= ctrl_alu_op;
+            id_ex_is_jal        <= ctrl_is_jal;
         end
     end
 
@@ -312,10 +326,14 @@ module top (
         .forward_b(forward_b)
     );
     // ALU Input MUX
-    reg [31:0] alu_input_a_mux; // 為了在 always 裡寫加一個 reg
-    reg [31:0] rs2_resolved;    // 處理 rs2 的 Forwarding (產生一個修正後的 rs2)
-    assign alu_input_a = alu_input_a_mux; 
-    assign alu_input_b = (id_ex_alu_src) ? id_ex_imm_ext : rs2_resolved;
+    reg [31:0]  alu_input_a_mux; // 為了在 always 裡寫加一個 reg
+    reg [31:0]  rs2_resolved;    // 處理 rs2 的 Forwarding (產生一個修正後的 rs2)
+    localparam  ALU_AUIPC = 4'b1011;    
+    wire        is_auipc = (id_ex_alu_op == ALU_AUIPC); 
+    // Input A (PC 通道): 如果是 JAL 或者是 AUIPC ，A 通道就借用 PC
+    assign alu_input_a = (id_ex_is_jal | is_auipc) ? id_ex_pc : alu_input_a_mux; 
+    // Input B: 只有 JAL 強制用 4 (AUIPC 會因為 is_jal=0 而走後面的邏輯，選到 imm)
+    assign alu_input_b = (id_ex_is_jal) ? 32'd4 : ((id_ex_alu_src) ? id_ex_imm_ext : rs2_resolved);
     always @(*) begin
         case (forward_a)
             2'b00:      alu_input_a_mux = id_ex_rs1_data; // alu_input_a = id_ex_rs1_data;
@@ -412,59 +430,115 @@ module Decoder(
     output reg        mem_read,
     output reg        mem_write,
     output reg        mem_to_reg,
-    output reg        imm_type,
-    output reg [3:0]  alu_op
+    // output reg        imm_type,
+    output reg [3:0]  alu_op,
+    output reg        is_jal  
 );
     wire [6:0] opcode = inst[6:0];      
     wire [2:0] funct3 = inst[14:12];    
     wire [6:0] funct7 = inst[31:25];    
-    // 定義 RISC-V Spec 參數 
-    localparam OP_R_TYPE = 7'b0110011; // ADD, SUB...
-    localparam OP_I_TYPE = 7'b0010011; // ADDI...
-    localparam OP_LOAD   = 7'b0000011; // LW...
-    localparam OP_STORE  = 7'b0100011; // SW...
-
-    // alu_op -> 定義 ALU 的動作
-    localparam ALU_ADD = 4'b0000;
-    localparam ALU_SUB = 4'b0001; // 預留給以後用
+    // ALU Operations (必須與 ALU module 裡的定義完全一樣！)
+    localparam ALU_ADD      = 4'b0000;
+    localparam ALU_SUB      = 4'b0001;
+    localparam ALU_SLL      = 4'b0010;
+    localparam ALU_SLT      = 4'b0011;
+    localparam ALU_SLTU     = 4'b0100;
+    localparam ALU_XOR      = 4'b0101;
+    localparam ALU_SRL      = 4'b0110;
+    localparam ALU_SRA      = 4'b0111;
+    localparam ALU_OR       = 4'b1000;
+    localparam ALU_AND      = 4'b1001;
+    localparam ALU_LUI      = 4'b1010;
+    localparam ALU_AUIPC    = 4'b1011;
+    // Opcode Definitions
+    localparam OP_R_TYPE    = 7'b0110011;
+    localparam OP_I_TYPE    = 7'b0010011;
+    localparam OP_LOAD      = 7'b0000011;
+    localparam OP_STORE     = 7'b0100011;
+    localparam OP_BRANCH    = 7'b1100011;
+    // JAL/JALR
+    localparam OP_JAL       = 7'b1101111;
+    localparam OP_JALR      = 7'b1100111;
+    localparam OP_LUI       = 7'b0110111;
+    // AUIPC
+    localparam OP_AUIPC     = 7'b0010111;
 
     always @(*) begin
-        // 預設值 (避免 Latch，這很重要！) ?????
-        reg_write =     1'b0;
-        alu_src =       1'b0;
-        mem_read =      1'b0;
-        mem_write =     1'b0;
-        mem_to_reg =    1'b0;
-        imm_type =      1'b0;
-        alu_op =        ALU_ADD;
-
+        reg_write   = 1'b0;
+        alu_src     = 1'b0;
+        mem_read    = 1'b0;
+        mem_write   = 1'b0;
+        mem_to_reg  = 1'b0;
+        alu_op      = ALU_ADD;
+        is_jal      = 1'b0; 
         case (opcode) 
-            OP_R_TYPE: begin
+            OP_R_TYPE: begin 
                 reg_write = 1'b1;
-                alu_src   = 1'b0; // 用 rs2
-                // 這裡要判斷 funct7 是 ADD 還是 SUB，Phase 1 只有 ADD
-                alu_op    = ALU_ADD;
+                alu_src   = 1'b0; // rs2
+                case (funct3)
+                    3'b000: alu_op = (funct7[5]) ? ALU_SUB : ALU_ADD; // 0:ADD, 1:SUB
+                    3'b001: alu_op = ALU_SLL;
+                    3'b010: alu_op = ALU_SLT;
+                    3'b011: alu_op = ALU_SLTU;
+                    3'b100: alu_op = ALU_XOR;
+                    3'b101: alu_op = (funct7[5]) ? ALU_SRA : ALU_SRL; // 0:SRL, 1:SRA
+                    3'b110: alu_op = ALU_OR;
+                    3'b111: alu_op = ALU_AND;
+                endcase
             end
-            OP_I_TYPE: begin // ADDI x1, x2, 10
+            OP_I_TYPE: begin 
                 reg_write = 1'b1;
-                alu_src   = 1'b1; // 用 Imm
-                alu_op    = ALU_ADD;
+                alu_src   = 1'b1; // Imm
+                case (funct3)
+                    3'b000: alu_op = ALU_ADD; // ADDI
+                    3'b001: alu_op = ALU_SLL; // SLLI
+                    3'b010: alu_op = ALU_SLT; // SLTI
+                    3'b011: alu_op = ALU_SLTU;// SLTIU
+                    3'b100: alu_op = ALU_XOR; // XORI
+                    3'b101: alu_op = (funct7[5]) ? ALU_SRA : ALU_SRL; // SRLI/SRAI
+                    3'b110: alu_op = ALU_OR;  // ORI
+                    3'b111: alu_op = ALU_AND; // ANDI
+                endcase
             end
-            OP_LOAD: begin // LW x1, 0(x2)
+            OP_LOAD: begin 
                 reg_write  = 1'b1;
                 mem_read   = 1'b1;
-                mem_to_reg = 1'b1; // 來自 Memory
-                alu_src    = 1'b1; // 算地址用 Imm
-                alu_op     = ALU_ADD; // 地址 = rs1 + imm
+                mem_to_reg = 1'b1; 
+                alu_src    = 1'b1; 
+                alu_op     = ALU_ADD; 
             end
-            OP_STORE: begin // SW x1, 0(x2)
-                mem_write  = 1'b1;
-                alu_src    = 1'b1; // 算地址用 Imm
-                alu_op     = ALU_ADD; // 地址 = rs1 + imm
+            OP_STORE: begin 
+                mem_write = 1'b1;
+                alu_src   = 1'b1; 
+                alu_op    = ALU_ADD; 
             end
-            default: begin
-                // 未定義指令，保持全 0 或設一個錯誤旗標
+            OP_LUI: begin
+                reg_write = 1'b1;
+                alu_src   = 1'b1; // Imm (LUI 的立即數)
+                alu_op    = ALU_LUI; // 特殊 OP：直接把 B (Imm) 傳出去，忽略 A
             end
+            OP_AUIPC: begin
+                reg_write = 1'b1;
+                alu_src   = 1'b1;
+                alu_op    = ALU_AUIPC; 
+            end
+            OP_JAL: begin
+                reg_write = 1'b1;
+                is_jal    = 1'b1; 
+                alu_op    = ALU_ADD; 
+            end
+            OP_JALR: begin
+                reg_write = 1'b1;
+                is_jal    = 1'b1; 
+                alu_src   = 1'b1; // JALR 是 rs1 + Imm
+                alu_op    = ALU_ADD; 
+            end    
+            // Branch 指令雖然不寫回，但需要 ALU 比較 (Phase 2 Branch Prediction 會用到)
+            OP_BRANCH: begin
+                alu_src = 1'b0; // rs1 vs rs2
+                alu_op  = ALU_SUB; // 用減法做比較
+            end
+            default: begin end
         endcase
     end
 endmodule
@@ -557,26 +631,49 @@ module ALU(
     output reg [31:0] alu_result,
     output            zero  // 順便做出來，以後 Branch 會感謝你
 );
-    // alu_op
-    localparam ALU_ADD = 4'b0000;
-    localparam ALU_SUB = 4'b0001; // 預留給以後用
-    localparam ALU_AND = 4'b0010; // Phase 1 先不用，預留
-    localparam ALU_OR  = 4'b0011; // Phase 1 先不用，預留
+    // alu_op : 定義 ALU 操作碼 (必須與 Decoder 一致)
+    localparam ALU_ADD      = 4'b0000;
+    localparam ALU_SUB      = 4'b0001;
+    localparam ALU_SLL      = 4'b0010;
+    localparam ALU_SLT      = 4'b0011;
+    localparam ALU_SLTU     = 4'b0100;
+    localparam ALU_XOR      = 4'b0101;
+    localparam ALU_SRL      = 4'b0110;
+    localparam ALU_SRA      = 4'b0111;
+    localparam ALU_OR       = 4'b1000;
+    localparam ALU_AND      = 4'b1001;
+    localparam ALU_LUI      = 4'b1010; // 專門給 LUI 用：直接輸出 Input B
+    localparam ALU_AUIPC    = 4'b1011;
 
-    // Zero Flag 的邏輯
-    // 這是 Combinational 的，只要 result 是 0，這個燈就亮
-    // 雖然是用 assign，但它其實是一個 32-input 的 NOR gate
     assign zero = (alu_result == 32'b0);
 
     always @(*) begin
         alu_result = 32'b0; 
         case (alu_op)
-            ALU_ADD:
-                alu_result = alu_input_a + alu_input_b;
-            ALU_SUB:
-                alu_result = alu_input_a - alu_input_b;
-            default:
-                alu_result = 32'b0;
+            ALU_ADD:    alu_result = alu_input_a + alu_input_b;
+            ALU_SUB:    alu_result = alu_input_a - alu_input_b;
+            ALU_AND:    alu_result = alu_input_a & alu_input_b;
+            ALU_OR:     alu_result = alu_input_a | alu_input_b;
+            ALU_XOR:    alu_result = alu_input_a ^ alu_input_b;
+            
+            // 移位運算 (只取 shift amount 的低 5 位)
+            ALU_SLL:    alu_result = alu_input_a << alu_input_b[4:0];
+            ALU_SRL:    alu_result = alu_input_a >> alu_input_b[4:0];
+            ALU_SRA:    alu_result = $signed(alu_input_a) >>> alu_input_b[4:0]; // 算術右移 (補 1)
+
+            // 比較運算 (Set Less Than)
+            // SLT: 有號數比較
+            ALU_SLT:    alu_result = ($signed(alu_input_a) < $signed(alu_input_b)) ? 32'd1 : 32'd0;
+            // SLTU: 無號數比較
+            ALU_SLTU:   alu_result = (alu_input_a < alu_input_b) ? 32'd1 : 32'd0;
+
+            // LUI 專用 (Pass Input B)
+            ALU_LUI:    alu_result = alu_input_b; 
+
+            // 為了 is_alupc 增加多個 reg 不是最優化的方法，有更好的方法:定義專屬的 ALU Opcode，讓 EX 階段看到這個 Opcode 時，自動知道「Input A 要選 PC」。
+            ALU_AUIPC:  alu_result = alu_input_a + alu_input_b; // 功能跟 ADD 一樣
+
+            default:  alu_result = 32'b0;
         endcase
     end
 endmodule
@@ -614,28 +711,21 @@ module HazardDetectionUnit(
     input        id_ex_mem_read,
     input [31:0] if_id_inst,
     input [4:0]  id_ex_rd_addr,
-
     // 檢查前面指令有沒有 LW data hazard
     input        ex_mem_mem_read,
     input        ex_mem_rd_addr,
-    // 檢查前面指令有沒有 單純拿 ALU 算出來的東西的 data hazard
-    input        ex_mem_reg_write,
-    input        mem_wb_reg_write,
     // 輸出控制訊號
     output reg pc_write,
     output reg if_id_write,
     output reg ctrl_flush
 ); 
-    wire [6:0] opcode   = if_id_inst[6:0];
-    wire [4:0] rs1_addr = if_id_inst[19:15];
-    wire [4:0] rs2_addr = if_id_inst[24:20];
-    // [修正] 判斷這是不是一條 Branch 指令 (B-Type)
-    // 只要是 Branch，我們就要特別小心處理資料相依
-    wire is_branch = (opcode == 7'b1100011); 
-    // 補充：其實 JALR (1100111) 也需要讀 rs1 來算跳轉目標
-    // 如果你要更嚴謹，可以把 JALR 也加進去：
-    wire is_jump_reg = (opcode == 7'b1100111);
-
+    wire [6:0] opcode       = if_id_inst[6:0];
+    wire [4:0] rs1_addr     = if_id_inst[19:15];
+    wire [4:0] rs2_addr     = if_id_inst[24:20];
+    // Branch 指令 (B-Type) 或是 JALR (1100111) ，要特別小心處理資料相依
+    wire       b_type       = (opcode == 7'b1100011); 
+    wire       jalr         = (opcode == 7'b1100111);
+    wire       is_branch    = (b_type || jalr);
     always @(*) begin
         // 預設值：不 Stall
         pc_write    = 1'b1;
@@ -657,16 +747,66 @@ module HazardDetectionUnit(
         // 條件 B: Branch Specific Load-Use Hazard (Distance 2)
         // ==========================================================
         // 上上條指令 (MEM) 是 Load，且目前的 ID 是 Branch。
-        // 因為我們為了 Ranking 1 決定不從 MEM 拉線回 ID (怕太慢)，
-        // 所以必須在這裡多 Stall 一個 Cycle，等 Load 走到 WB 階段。
+        // 不從 MEM 拉線回 ID (怕 SRAM mem access 太慢)，多 Stall 一個 Cycle，等 Load 走到 WB 階段。
         else if (ex_mem_mem_read && (ex_mem_rd_addr == rs1_addr || ex_mem_rd_addr == rs2_addr) && is_branch) begin
             // [關鍵] 這裡用 is_branch，而不是 branch_taken！
             pc_write    = 1'b0;
             if_id_write = 1'b0;
             ctrl_flush  = 1'b1;
         end
-
     end
+endmodule
+
+module ID_Forwarding_Mux(           // 進入 BranchResolutionUnit 的 rs1_data & rs2_data 都可以使用的 "選擇器(MUX)"
+    input  [4:0]  rs_addr,          // 來源暫存器地址 (rs1 or rs2)
+    input  [31:0] reg_rdata,        // RegFile 讀出來的原始資料
+    
+    // 來自 EX 階段的資訊 (Priority 1 - 最鮮活的資料)
+    input  [4:0]  id_ex_rd_addr,
+    input         id_ex_reg_write,
+    input  [31:0] alu_result,       // 來自 ALU 的計算結果
+    
+    // 來自 MEM 階段的資訊 (Priority 2)
+    input  [4:0]  ex_mem_rd_addr,
+    input         ex_mem_reg_write,
+    input         ex_mem_mem_read,  // 判斷是否為 Load 指令
+    input  [31:0] ex_mem_alu_out,   // ALU 運算結果傳遞
+    input  [31:0] mem_rdata,        // Memory 讀出的資料 (從 DM 來的)
+    
+    // 來自 WB 階段的資訊 (Priority 3)
+    input  [4:0]  mem_wb_rd_addr,
+    input         mem_wb_reg_write,
+    input  [31:0] wb_write_data,    // 準備寫回 RegFile 的資料
+
+    output reg [31:0] resolved_data // 最終決定的資料 (給 Branch Unit 用)
+);
+
+    always @(*) begin
+        // Default: 沒人用這顆暫存器，直接用 RegFile 讀到的值
+        resolved_data = reg_rdata;
+
+        // Priority 1: Forward from EX Stage (Aggressive Forwarding)
+        // 情況：上一條指令剛算完 (ALU)，還沒寫回
+        if (id_ex_reg_write && (id_ex_rd_addr != 0) && (id_ex_rd_addr == rs_addr)) begin
+            resolved_data = alu_result;
+        end
+        
+        // Priority 2: Forward from MEM Stage
+        // 情況：上上條指令在 MEM 階段
+        else if (ex_mem_reg_write && (ex_mem_rd_addr != 0) && (ex_mem_rd_addr == rs_addr)) begin
+            if (ex_mem_mem_read) 
+                resolved_data = mem_rdata;      // 如果是 Load，取 Memory 資料
+            else                 
+                resolved_data = ex_mem_alu_out; // 如果是 ALU 運算，取 ALU 結果
+        end
+        
+        // Priority 3: Forward from WB Stage
+        // 情況：上上上條指令在 WB 階段 (正在寫回)
+        else if (mem_wb_reg_write && (mem_wb_rd_addr != 0) && (mem_wb_rd_addr == rs_addr)) begin
+            resolved_data = wb_write_data;
+        end
+    end
+
 endmodule
 
 module BranchResolutionUnit ( 
@@ -680,9 +820,27 @@ module BranchResolutionUnit (
     output [31:0] branch_target     // 告訴 PC Mux 下一跳去哪
 );
     // 優化：branch_target共用同一個加法器
-    wire [31:0] base_addr;
-    assign base_addr = (opcode == 7'b1100111) ? rs1_data : pc;
-    assign branch_target = base_addr + imm;
+    wire    [31:0]  base_addr       = (opcode == 7'b1100111) ? rs1_data : pc;
+    assign          branch_target   = (base_addr + imm) & ~32'd1; // 強制將最低位設為 0
+
+    // [優化] Shared Subtractor & Flag Generation
+    // 我們多加 1-bit 來處理 Unsigned 的借位 (Carry/Borrow) 
+    wire    [32:0]  sub_res         = {1'b0, rs1_data} - {1'b0, rs2_data};
+    // 提取 Flags
+    wire            z_flag          = (sub_res[31:0] == 0);      // Zero (相等)
+    wire            n_flag          = sub_res[31];               // Negative (結果為負)
+    wire            v_flag          = (rs1_data[31] != rs2_data[31]) && (sub_res[31] != rs1_data[31]); // Overflow (有號數溢位)
+    wire            c_flag          = sub_res[32];               // Carry/Borrow (無號數借位: 1代表沒借位(A>=B), 0代表有借位(A<B))
+    // 註：Verilog 的減法借位定義可能因工具而異，
+    // 更穩的 Unsigned 比較是直接看 sub_res[32] (如果 A-B 產生借位，最高位會變)
+    // 或是直接用 Verilog 的 < 但限制在一個 expression 裡。
+    // 這裡為了絕對的面積優化，我們用邏輯推導：
+    
+    // Signed Less Than (SLT): (N != V)
+    wire            lt_signed       = (n_flag != v_flag);
+    // Unsigned Less Than (SLTU): A < B 等同於 A - B 產生借位 (Sub result is negative in extended bit if treated right)
+    // 簡單寫法： rs1 < rs2
+    wire            lt_unsigned     = (rs1_data < rs2_data); // 讓工具去合這個，通常很小
 
     always @(*) begin
         branch_taken = 1'b0;  // 預設：沒 mispredict（predict not taken）
@@ -691,12 +849,12 @@ module BranchResolutionUnit (
             7'b1100111: branch_taken = 1'b1; // JALR: rd=PC+4, PC=imm+rs1
             7'b1100011: begin
                 case (funct3)
-                    3'b000: branch_taken = (rs1_data == rs2_data); // BEQ
-                    3'b001: branch_taken = (rs1_data != rs2_data); // BNE
-                    3'b100: branch_taken = ($signed(rs1_data) <  $signed(rs2_data)); // BLT
-                    3'b101: branch_taken = ($signed(rs1_data) >= $signed(rs2_data)); // BGE
-                    3'b110: branch_taken = (rs1_data <  rs2_data); // BLTU (Unsigned)
-                    3'b111: branch_taken = (rs1_data >= rs2_data); // BGEU (Unsigned)
+                    3'b000: branch_taken = z_flag;          // (rs1_data == rs2_data);                      // BEQ
+                    3'b001: branch_taken = !z_flag;         // (rs1_data != rs2_data);                      // BNE
+                    3'b100: branch_taken = lt_signed;       // ($signed(rs1_data) <  $signed(rs2_data));    // BLT
+                    3'b101: branch_taken = !lt_signed;      // ($signed(rs1_data) >= $signed(rs2_data));    // BGE
+                    3'b110: branch_taken = lt_unsigned;     // (rs1_data <  rs2_data);                      // BLTU (Unsigned)
+                    3'b111: branch_taken = !lt_unsigned;    // (rs1_data >= rs2_data);                      // BGEU (Unsigned)
                     default: branch_taken = 1'b0;
                 endcase
             end

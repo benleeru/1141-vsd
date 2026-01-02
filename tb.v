@@ -2,23 +2,18 @@
 `include "top.v" // 記得確認你的 top 檔名
 
 /*
-驗證全功能的 Testbench (tb_final.v)
-    這個 Testbench 設計了像電影情節一樣的連續技，一次測試所有功能：
-        Store/Load (測試記憶體存取)
-        Load-Use Hazard (測試 Stall 機制 <-- 重點)
-        Data Hazard (測試 Forwarding 機制)
-        Internal Forwarding (測試 WB -> ID 機制)
+x1 必須是 0x01000000。
+這證明你的 ALU_AUIPC 機制成功運作，正確抓到了 PC 和 Imm。
+如果看到 4，代表 MUX 邏輯有錯。
 
-預期結果 (Pass Criteria)
-    跑完模擬後，請檢查 RegFile：
-        x3 = 10: 
-            證明 LW 成功從記憶體讀回資料 (Store 也成功)。
-        x4 = 20: 
-            證明 Stall 成功！(如果沒 Stall，x3 會讀到舊值 0，x4 就會算錯)。
-            同時證明 Stall 後的 WB->EX Forwarding 也成功。
-        x5 = 30: 
-            證明標準的 EX->EX Forwarding 正常工作。
-    如果這三個值都對，CPU 就正式具備了處理所有 Data Hazard 和 Load-Use Hazard 的能力，
+x3 (Return Address) 必須是 16 (0x10)。
+這證明 JALR 的寫回功能正確。
+
+x4 必須是 88 (0x58)。
+這證明 CPU 成功跳到了 0x1000。
+
+請觀察波形中的 pc 訊號，在執行 JALR 後，pc 應該直接變成 0x1000。
+如果 pc 變成 0x1001，代表你的 Masking (& ~1) 沒生效。
 */
 
 module tb;
@@ -26,109 +21,93 @@ module tb;
     reg rst;
     
     // 介面訊號
-    wire [31:0] ARADDR_IM;
-    wire ARVALID_IM;
-    reg  [127:0] RDATA_IM; 
-    wire [31:0] ARADDR_DM;
-    wire ARVALID_DM;
-    wire [31:0] AWADDR_DM;
+    wire [31:0] ARADDR_IM, ARADDR_DM, AWADDR_DM;
+    wire ARVALID_IM, ARVALID_DM, AWVALID_DM, WVALID_DM;
+    reg  [127:0] RDATA_IM, RDATA_DM;
     wire [127:0] WDATA_DM;
-    wire AWVALID_DM;
-    wire WVALID_DM;
-
-    // 模擬記憶體 (4KB)
-    reg [31:0] IM_MEM [0:1023]; 
-    reg [31:0] DM_MEM [0:1023]; 
     
+    // 擴大記憶體空間以容納跳轉測試
+    reg [31:0] IM_MEM [0:4095]; 
+    reg [31:0] DM_MEM [0:4095]; 
     integer i;
 
     // 實例化 CPU
     top CPU (
-        .clk(clk),
-        .rst(rst),
+        .clk(clk), .rst(rst),
         .ARADDR_IM(ARADDR_IM), .ARVALID_IM(ARVALID_IM), .ARREADY_IM(1'b1),
         .RDATA_IM(RDATA_IM), .RVALID_IM(1'b1), .RREADY_IM(),
         .ARADDR_DM(ARADDR_DM), .ARVALID_DM(ARVALID_DM), .ARREADY_DM(1'b1),
-        .RDATA_DM({96'b0, DM_MEM[ARADDR_DM[11:2]]}), 
-        .RVALID_DM(1'b1), .RREADY_DM(),
+        .RDATA_DM(RDATA_DM), .RVALID_DM(1'b1), .RREADY_DM(),
         .AWADDR_DM(AWADDR_DM), .AWVALID_DM(AWVALID_DM), .AWREADY_DM(1'b1),
         .WDATA_DM(WDATA_DM), .WVALID_DM(WVALID_DM), .WREADY_DM(1'b1), .WSTRB_DM()
     );
 
-    // Clock
     always #5 clk = ~clk;
 
-    // DM 寫入行為
+    // 記憶體模型 (Byte Address -> Word Index)
+    // 這裡我們模擬簡單的 Memory，忽略未對齊存取 (因為 CPU 應該要自己對齊)
     always @(posedge clk) begin
         if (AWVALID_DM && WVALID_DM) begin
-            DM_MEM[AWADDR_DM[11:2]] <= WDATA_DM[31:0];
+            DM_MEM[AWADDR_DM[13:2]] <= WDATA_DM[31:0];
         end
     end
-
-    // IM 讀取行為
+    
     always @(*) begin
-        if (ARVALID_IM) 
-            RDATA_IM = {96'b0, IM_MEM[ARADDR_IM[11:2]]};
-        else 
-            RDATA_IM = 0;
+        // IM read
+        if (ARVALID_IM) RDATA_IM = {96'b0, IM_MEM[ARADDR_IM[13:2]]};
+        else            RDATA_IM = 0;
+        
+        // DM read
+        if (ARVALID_DM) RDATA_DM = {96'b0, DM_MEM[ARADDR_DM[13:2]]};
+        else            RDATA_DM = 0;
     end
 
     initial begin
-        clk = 0;
-        rst = 1;
+        clk = 0; rst = 1;
+        // 初始化 NOP
+        for (i=0; i<4096; i=i+1) begin IM_MEM[i]=32'h00000013; DM_MEM[i]=0; end
 
-        // 初始化記憶體 (NOP)
-        for (i = 0; i < 1024; i = i + 1) begin
-            IM_MEM[i] = 32'h00000013; 
-            DM_MEM[i] = 32'h0;
-        end
+        // =============================================================
+        //  Phase 1 Strict Verification Program
+        // =============================================================
         
-        // =========================================================
-        // 測試程式碼
-        // =========================================================
-        
-        // 1. 初始化資料 x1=10, x2=0
-        IM_MEM[0] = 32'h00A00093; // ADDI x1, x0, 10
-        IM_MEM[1] = 32'h00000113; // ADDI x2, x0, 0
-        
-        // 2. 測試 Branch Not Taken (Forwarding 測試)
-        // BNE x1, x2, +8 (10 != 0, 應該跳) -> 預期: 跳到 PC=12 (Idx 3)
-        // 這裡會用到 ID Forwarding (因為 x1 還在 Pipeline 裡)
-        IM_MEM[2] = 32'h00209463; 
-        
-        // --- 這裡應該被 Flush 掉 (Branch Taken) ---
-        IM_MEM[3] = 32'h00500293; // ADDI x5, x0, 5 (如果 x5 變 5 就錯了)
-        
-        // 3. Branch Target (PC=16, Idx 4)
-        // ADDI x3, x0, 30 (證明跳轉成功)
-        IM_MEM[4] = 32'h01E00193; 
+        // 1. [AUIPC Test] 測試你的 MUX 優化是否正確
+        // PC=0: AUIPC x1, 0x1000 (x1 = 0 + 0x01000000)
+        // 預期: x1 = 0x01000000 (如果 MUX 錯選成 JAL 的 4，這裡會變 4)
+        IM_MEM[0] = 32'h01000097; 
 
-        // 4. 測試 Load-Use Stall + Branch
-        // SW x3, 0(x2) -> Mem[0] = 30
-        IM_MEM[5] = 32'h00312023; 
-        // LW x4, 0(x2) -> x4 = 30
-        IM_MEM[6] = 32'h00012203; 
-        // BEQ x4, x3, +8 (30 == 30, 應該跳) -> 預期: 跳到 PC=36 (Idx 9)
-        // 這裡有 Load-Use Hazard! ID 階段必須 Stall 等 LW 的資料
-        IM_MEM[7] = 32'h00320463; 
+        // 2. [LUI Test] 基礎大數載入
+        // PC=4: LUI x2, 0x1 (x2 = 0x00001000)
+        IM_MEM[1] = 32'h00001137;
+
+        // 3. [JALR Masking Test] 測試最低位遮罩
+        // 準備一個奇數地址： x2 = x2 + 1 = 0x00001001
+        // PC=8: ADDI x2, x2, 1
+        IM_MEM[2] = 32'h00110113; 
         
-        // --- 這裡應該被 Flush 掉 ---
-        IM_MEM[8] = 32'h00600313; // ADDI x6, x0, 6 (如果 x6 變 6 就錯了)
+        // 嘗試跳轉到 x2 (0x1001)
+        // 預期：CPU 應該將其修正為 0x1000 (Idx 1024)，而不是 0x1001
+        // 並且將 Return Address (PC+4=16) 寫入 x3
+        // PC=12: JALR x3, 0(x2)
+        IM_MEM[3] = 32'h000101E7;
 
-        // 5. Jump Target (PC=36, Idx 9)
-        // JAL x7, +4 (x7=PC+4=40, 跳到 PC=40)
-        IM_MEM[9] = 32'h004003EF; 
+        // --- 這裡應該被跳過 (PC 16~...) ---
+        
+        // 4. [Target Address] 
+        // 這是地址 0x1000 (Word Index 1024)
+        // 如果 JALR 沒切 bit 0，可能會抓不到這行，或者抓錯
+        // PC=4096 (0x1000): ADDI x4, x0, 88 (Flag)
+        IM_MEM[1024] = 32'h05800213; 
 
-        // 6. JAL Target (PC=40, Idx 10)
-        // ADDI x8, x0, 80 (結束)
-        IM_MEM[10] = 32'h05000413;
+        // 結束 (NOP loop)
+        IM_MEM[1025] = 32'h00000013;
 
-        // Reset 釋放
         #20 rst = 0;
         
-        #500;
-        $display("Test Finished.");
+        // 等待足夠時間讓 CPU 執行到遠端跳轉
+        #2000;
+        
+        $display("Strict Test Finished. Check Waveforms.");
         $finish;
     end
-
 endmodule
